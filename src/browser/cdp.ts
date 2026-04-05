@@ -165,6 +165,17 @@ export class CDPBridge implements IBrowserFactory {
 
 class CDPPage extends BasePage {
   private _pageEnabled = false;
+
+  // Network capture state (mirrors extension/src/cdp.ts NetworkCaptureEntry shape)
+  private _networkCapturing = false;
+  private _networkCapturePattern = '';
+  private _networkEntries: Array<{
+    url: string; method: string; responseStatus?: number;
+    responseContentType?: string; responsePreview?: string; timestamp: number;
+  }> = [];
+  private _pendingRequests = new Map<string, number>(); // requestId → index in _networkEntries
+  private _pendingBodyFetches: Set<Promise<void>> = new Set(); // track in-flight getResponseBody calls
+
   constructor(private bridge: CDPBridge) {
     super();
   }
@@ -217,6 +228,74 @@ class CDPPage extends BasePage {
       await saveBase64ToFile(base64, options.path);
     }
     return base64;
+  }
+
+  async startNetworkCapture(pattern: string = ''): Promise<void> {
+    this._networkCapturePattern = pattern;
+    this._networkEntries = [];
+    this._pendingRequests.clear();
+    this._pendingBodyFetches.clear();
+
+    if (!this._networkCapturing) {
+      await this.bridge.send('Network.enable');
+
+      // Step 1: Record request method/url on requestWillBeSent
+      this.bridge.on('Network.requestWillBeSent', (params: unknown) => {
+        const p = params as { requestId: string; request: { method: string; url: string }; timestamp: number };
+        if (!pattern || p.request.url.includes(pattern)) {
+          const idx = this._networkEntries.push({
+            url: p.request.url,
+            method: p.request.method,
+            timestamp: p.timestamp,
+          }) - 1;
+          this._pendingRequests.set(p.requestId, idx);
+        }
+      });
+
+      // Step 2: Fill in response metadata on responseReceived
+      this.bridge.on('Network.responseReceived', (params: unknown) => {
+        const p = params as { requestId: string; response: { status: number; mimeType?: string } };
+        const idx = this._pendingRequests.get(p.requestId);
+        if (idx !== undefined) {
+          this._networkEntries[idx].responseStatus = p.response.status;
+          this._networkEntries[idx].responseContentType = p.response.mimeType || '';
+        }
+      });
+
+      // Step 3: Fetch body on loadingFinished (body is only reliably available after this)
+      this.bridge.on('Network.loadingFinished', (params: unknown) => {
+        const p = params as { requestId: string };
+        const idx = this._pendingRequests.get(p.requestId);
+        if (idx !== undefined) {
+          const bodyFetch = this.bridge.send('Network.getResponseBody', { requestId: p.requestId }).then((result: unknown) => {
+            const r = result as { body?: string; base64Encoded?: boolean } | undefined;
+            if (typeof r?.body === 'string') {
+              this._networkEntries[idx].responsePreview = r.base64Encoded
+                ? `base64:${r.body.slice(0, 4000)}`
+                : r.body.slice(0, 4000);
+            }
+          }).catch(() => {
+            // Body unavailable for some requests (e.g. uploads) — non-fatal
+          }).finally(() => {
+            this._pendingBodyFetches.delete(bodyFetch);
+          });
+          this._pendingBodyFetches.add(bodyFetch);
+          this._pendingRequests.delete(p.requestId);
+        }
+      });
+
+      this._networkCapturing = true;
+    }
+  }
+
+  async readNetworkCapture(): Promise<unknown[]> {
+    // Await all in-flight body fetches so entries have responsePreview populated
+    if (this._pendingBodyFetches.size > 0) {
+      await Promise.all([...this._pendingBodyFetches]);
+    }
+    const entries = [...this._networkEntries];
+    this._networkEntries = [];
+    return entries;
   }
 
   async tabs(): Promise<unknown[]> {
