@@ -86,10 +86,20 @@ const { registerUpdateNoticeOnExit, checkForUpdateBackground } = await import('.
 
 installNodeNetwork();
 
-// Sequential: plugins must run after built-in discovery so they can override built-in commands.
-await ensureUserCliCompatShims();
-await ensureUserAdapters();
-await discoverClis(BUILTIN_CLIS, USER_CLIS);
+// Parallelise independent startup I/O:
+//  - Built-in adapter discovery has no dependency on user-dir setup.
+//  - ensureUserCliCompatShims and ensureUserAdapters operate on different paths
+//    (~/.opencli/node_modules/ vs ~/.opencli/clis/ + adapter-manifest.json).
+//  - registerCommand() overwrites on name collision (see registry.ts), so
+//    user-CLI discovery MUST run after built-in discovery to preserve the
+//    intended override order (user adapters override built-in ones).
+//  - discoverPlugins runs last: plugins may override both built-in and user CLIs.
+const [, ,] = await Promise.all([
+  ensureUserCliCompatShims(),
+  ensureUserAdapters(),
+  discoverClis(BUILTIN_CLIS),
+]);
+await discoverClis(USER_CLIS);
 await discoverPlugins();
 
 // Register exit hook: notice appears after command output (same as npm/gh/yarn)
